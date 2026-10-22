@@ -1,13 +1,14 @@
 #include "rdf_graph_generator.hpp"
-#include "graph_memory_tracker.hpp"
 #include <iostream>
 #include <chrono>
 #include <iomanip>
+#include <cstdio>
+#include <sys/resource.h>
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/task_info.h>
 #elif __linux__
-#include <sys/resource.h>
+#include <unistd.h>
 #endif
 
 RDFGraph::RDFGraph() : db_(nullptr) {
@@ -22,17 +23,17 @@ void RDFGraph::clear() {
         sqlite3_close(db_);
         db_ = nullptr;
     }
+    terms_.clear();
     nodes_.clear();
+    isNode_.clear();
     edges_.clear();
-    outgoingEdges_.clear();
-    incomingEdges_.clear();
-    allTriples_.clear();
-    typeTriples_.clear();
-    assertedTriples_.clear();
-    literalTriples_.clear();
+    outgoing_.clear();
+    incoming_.clear();
+    byPredicate_.clear();
+    typeCount_ = assertedCount_ = literalCount_ = 0;
 }
 
-// 메모리 사용량 조회 함수 (플랫폼별)
+// 현재 RSS (bytes)
 static size_t getCurrentMemoryUsage() {
 #ifdef __APPLE__
     struct task_basic_info info;
@@ -43,85 +44,86 @@ static size_t getCurrentMemoryUsage() {
     }
     return 0;
 #elif __linux__
-    struct rusage usage;
-    if (getrusage(RUSAGE_SELF, &usage) == 0) {
-        return usage.ru_maxrss * 1024; // KB to bytes
-    }
-    return 0;
+    // ru_maxrss 는 peak 값이라 현재 RSS 는 /proc/self/statm 에서 읽음
+    long pages = 0, resident = 0;
+    FILE* f = std::fopen("/proc/self/statm", "r");
+    if (!f) return 0;
+    int n = std::fscanf(f, "%ld %ld", &pages, &resident);
+    std::fclose(f);
+    if (n != 2) return 0;
+    return static_cast<size_t>(resident) * static_cast<size_t>(sysconf(_SC_PAGESIZE));
 #else
     return 0;
 #endif
 }
 
+// ru_maxrss 는 프로세스 peak. Linux 는 KB, macOS 는 bytes.
+static size_t getPeakRssBytes() {
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) != 0) return 0;
+#ifdef __APPLE__
+    return static_cast<size_t>(usage.ru_maxrss);
+#else
+    return static_cast<size_t>(usage.ru_maxrss) * 1024;
+#endif
+}
+
+static const char* columnText(sqlite3_stmt* stmt, int col) {
+    return reinterpret_cast<const char*>(sqlite3_column_text(stmt, col));
+}
+
 bool RDFGraph::loadFromDatabase(const std::string& dbPath) {
-    auto startTime = std::chrono::high_resolution_clock::now();
-    // 그래프용 메모리 트래커 초기화
-    GraphMemoryTracker::reset();
+    auto startTime = std::chrono::steady_clock::now();
     size_t memoryBefore = getCurrentMemoryUsage();
-    
-    // 기존 연결이 있으면 닫기
-    if (db_) {
-        sqlite3_close(db_);
-        db_ = nullptr;
-    }
-    
-    // 데이터베이스 열기
-    int rc = sqlite3_open(dbPath.c_str(), &db_);
+
+    clear();
+
+    int rc = sqlite3_open_v2(dbPath.c_str(), &db_, SQLITE_OPEN_READONLY, nullptr);
     if (rc != SQLITE_OK) {
         std::cerr << "데이터베이스 열기 실패: " << sqlite3_errmsg(db_) << std::endl;
         return false;
     }
-    
-    // 기존 데이터 정리
-    nodes_.clear();
-    edges_.clear();
-    outgoingEdges_.clear();
-    incomingEdges_.clear();
-    allTriples_.clear();
-    typeTriples_.clear();
-    assertedTriples_.clear();
-    literalTriples_.clear();
-    
-    // 각 테이블에서 데이터 로드
+
     if (!loadTypeStatements()) {
         std::cerr << "타입 트리플 로드 실패" << std::endl;
         return false;
     }
-    
     if (!loadAssertedStatements()) {
         std::cerr << "어설션 트리플 로드 실패" << std::endl;
         return false;
     }
-    
     if (!loadLiteralStatements()) {
         std::cerr << "리터럴 트리플 로드 실패" << std::endl;
         return false;
     }
-    
-    auto endTime = std::chrono::high_resolution_clock::now();
+
+    // 로드 끝났으면 DB 는 더 안 씀
+    sqlite3_close(db_);
+    db_ = nullptr;
+
+    auto endTime = std::chrono::steady_clock::now();
     size_t memoryAfter = getCurrentMemoryUsage();
-    
+
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
     size_t memoryUsed = memoryAfter > memoryBefore ? memoryAfter - memoryBefore : 0;
-    
-    // 로그 출력
+
     std::cout << std::fixed << std::setprecision(2);
     std::cout << "========================================" << std::endl;
     std::cout << "RDF 그래프 생성 완료" << std::endl;
     std::cout << "========================================" << std::endl;
-    std::cout << "소요 시간: " << duration.count() << " ms (" 
+    std::cout << "소요 시간: " << duration.count() << " ms ("
               << (duration.count() / 1000.0) << " 초)" << std::endl;
-    std::cout << "메모리 사용량(프로세스 RSS 기준): " << (memoryUsed / 1024.0 / 1024.0) << " MB" << std::endl;
-    std::cout << "그래프 추정 메모리(GraphMemoryTracker 기준): "
-              << (getTrackedMemoryBytes() / 1024.0 / 1024.0) << " MB" << std::endl;
-    std::cout << "총 트리플 수: " << allTriples_.size() << std::endl;
-    std::cout << "  - 타입 트리플: " << typeTriples_.size() << std::endl;
-    std::cout << "  - 어설션 트리플: " << assertedTriples_.size() << std::endl;
-    std::cout << "  - 리터럴 트리플: " << literalTriples_.size() << std::endl;
+    std::cout << "메모리 사용량(현재 RSS 증가분): " << (memoryUsed / 1024.0 / 1024.0) << " MB" << std::endl;
+    std::cout << "peak RSS: " << (getPeakRssBytes() / 1024.0 / 1024.0) << " MB" << std::endl;
+    std::cout << "총 트리플 수: " << (typeCount_ + assertedCount_ + literalCount_) << std::endl;
+    std::cout << "  - 타입 트리플: " << typeCount_ << std::endl;
+    std::cout << "  - 어설션 트리플: " << assertedCount_ << std::endl;
+    std::cout << "  - 리터럴 트리플: " << literalCount_ << std::endl;
     std::cout << "총 노드 수: " << nodes_.size() << std::endl;
     std::cout << "총 엣지 수: " << edges_.size() << std::endl;
+    std::cout << "고유 문자열 수: " << terms_.size() << std::endl;
     std::cout << "========================================" << std::endl;
-    
+
     return true;
 }
 
@@ -129,371 +131,213 @@ std::string RDFGraph::findTableName(const std::string& pattern) {
     if (!db_) {
         return "";
     }
-    
-    std::string query = "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '" + pattern + "'";
+
+    const char* query = "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?";
     sqlite3_stmt* stmt;
-    
-    if (sqlite3_prepare_v2(db_, query.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+    if (sqlite3_prepare_v2(db_, query, -1, &stmt, nullptr) != SQLITE_OK) {
         return "";
     }
-    
+    sqlite3_bind_text(stmt, 1, pattern.c_str(), -1, SQLITE_TRANSIENT);
+
     std::string tableName;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
-        const char* name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        const char* name = columnText(stmt, 0);
         if (name) {
             tableName = name;
         }
     }
-    
     sqlite3_finalize(stmt);
     return tableName;
 }
 
 bool RDFGraph::loadTypeStatements() {
-    if (!db_) {
-        return false;
-    }
-    
-    // 테이블 이름 찾기 (kb_*_type_statements)
     std::string tableName = findTableName("kb_%_type_statements");
     if (tableName.empty()) {
         std::cerr << "타입 스테이트먼트 테이블을 찾을 수 없습니다." << std::endl;
         return false;
     }
-    
-    std::string query = "SELECT id, member, klass, context, termcomb FROM " + tableName;
+
+    std::string query = "SELECT member, klass FROM " + tableName;
     sqlite3_stmt* stmt;
-    
     if (sqlite3_prepare_v2(db_, query.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
         std::cerr << "쿼리 준비 실패: " << sqlite3_errmsg(db_) << std::endl;
         return false;
     }
-    
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        RDFTriple triple;
-        
-        // member (subject) - 노드 URI
-        const char* member = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        if (!member) continue;
-        triple.subject = member;
-        
-        // klass (object, 타입) - 노드 URI
-        const char* klass = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-        if (!klass) continue;
-        triple.object = klass;
-        
-        // context
-        const char* context = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
-        if (context) {
-            triple.context = context;
-        }
-        
-        // termcomb
-        triple.termcomb = sqlite3_column_int(stmt, 4);
-        
-        // predicate는 rdf:type
-        triple.predicate = "rdf:type";
-        triple.isLiteral = false;
-        
-        typeTriples_.push_back(triple);
-        allTriples_.push_back(triple);
-        // 트리플 저장에 따른 대략적인 메모리 증가 추적
-        GraphMemoryTracker::add(sizeof(RDFTriple));
-        
-        // 그래프 구조: (member:uri) --[rdf:type]--> (klass:uri)
-        addNode(triple.subject);  // member URI를 노드로 추가
-        addNode(triple.object);  // klass URI를 노드로 추가
-        addEdge(triple.subject, "rdf:type", triple.object, false);  // 엣지 추가
+
+    const TermId rdfType = terms_.intern("rdf:type");
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char* member = columnText(stmt, 0);
+        const char* klass = columnText(stmt, 1);
+        if (!member || !klass) continue;
+
+        TermId s = terms_.intern(member);
+        TermId o = terms_.intern(klass);
+        ++typeCount_;
+        addNode(s);
+        addNode(o);
+        addEdge(s, rdfType, o, false);
     }
-    
+
+    if (rc != SQLITE_DONE) {
+        std::cerr << "쿼리 실행 실패: " << sqlite3_errmsg(db_) << std::endl;
+        sqlite3_finalize(stmt);
+        return false;
+    }
     sqlite3_finalize(stmt);
     return true;
 }
 
 bool RDFGraph::loadAssertedStatements() {
-    if (!db_) {
-        return false;
-    }
-    
-    // 테이블 이름 찾기 (kb_*_asserted_statements)
     std::string tableName = findTableName("kb_%_asserted_statements");
     if (tableName.empty()) {
         std::cerr << "어설션 스테이트먼트 테이블을 찾을 수 없습니다." << std::endl;
         return false;
     }
-    
-    std::string query = "SELECT id, subject, predicate, object, context, termcomb FROM " + tableName;
+
+    std::string query = "SELECT subject, predicate, object FROM " + tableName;
     sqlite3_stmt* stmt;
-    
     if (sqlite3_prepare_v2(db_, query.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
         std::cerr << "쿼리 준비 실패: " << sqlite3_errmsg(db_) << std::endl;
         return false;
     }
-    
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        RDFTriple triple;
-        
-        // subject - 노드 URI
-        const char* subject = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        if (!subject) continue;
-        triple.subject = subject;
-        
-        // predicate - 엣지 타입
-        const char* predicate = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-        if (!predicate) continue;
-        triple.predicate = predicate;
-        
-        // object - 노드 URI
-        const char* object = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
-        if (!object) continue;
-        triple.object = object;
-        
-        // context
-        const char* context = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
-        if (context) {
-            triple.context = context;
-        }
-        
-        // termcomb
-        triple.termcomb = sqlite3_column_int(stmt, 5);
-        
-        triple.isLiteral = false;
-        
-        assertedTriples_.push_back(triple);
-        allTriples_.push_back(triple);
-        // 트리플 저장에 따른 대략적인 메모리 증가 추적
-        GraphMemoryTracker::add(sizeof(RDFTriple));
-        
-        // 그래프 구조: (subject:uri) --[predicate]--> (object:uri)
-        addNode(triple.subject);  // subject URI를 노드로 추가
-        addNode(triple.object);  // object URI를 노드로 추가
-        addEdge(triple.subject, triple.predicate, triple.object, false);  // 엣지 추가
+
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char* subject = columnText(stmt, 0);
+        const char* predicate = columnText(stmt, 1);
+        const char* object = columnText(stmt, 2);
+        if (!subject || !predicate || !object) continue;
+
+        TermId s = terms_.intern(subject);
+        TermId p = terms_.intern(predicate);
+        TermId o = terms_.intern(object);
+        ++assertedCount_;
+        addNode(s);
+        addNode(o);
+        addEdge(s, p, o, false);
     }
-    
+
+    if (rc != SQLITE_DONE) {
+        std::cerr << "쿼리 실행 실패: " << sqlite3_errmsg(db_) << std::endl;
+        sqlite3_finalize(stmt);
+        return false;
+    }
     sqlite3_finalize(stmt);
     return true;
 }
 
 bool RDFGraph::loadLiteralStatements() {
-    if (!db_) {
-        return false;
-    }
-    
-    // 테이블 이름 찾기 (kb_*_literal_statements)
     std::string tableName = findTableName("kb_%_literal_statements");
     if (tableName.empty()) {
         std::cerr << "리터럴 스테이트먼트 테이블을 찾을 수 없습니다." << std::endl;
         return false;
     }
-    
-    std::string query = "SELECT id, subject, predicate, object, context, termcomb, objlanguage, objdatatype FROM " + tableName;
+
+    std::string query = "SELECT subject, predicate, object, objlanguage, objdatatype FROM " + tableName;
     sqlite3_stmt* stmt;
-    
     if (sqlite3_prepare_v2(db_, query.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
         std::cerr << "쿼리 준비 실패: " << sqlite3_errmsg(db_) << std::endl;
         return false;
     }
-    
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        RDFTriple triple;
-        
-        // subject - 노드 URI
-        const char* subject = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        if (!subject) continue;
-        triple.subject = subject;
-        
-        // predicate - 엣지 타입
-        const char* predicate = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-        if (!predicate) continue;
-        triple.predicate = predicate;
-        
-        // object (리터럴 값) - 노드가 아님
-        const char* object = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
-        if (!object) continue;
-        triple.object = object;
-        
-        // context
-        const char* context = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
-        if (context) {
-            triple.context = context;
-        }
-        
-        // termcomb
-        triple.termcomb = sqlite3_column_int(stmt, 5);
-        
-        // objlanguage
-        const char* objlanguage = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
-        if (objlanguage) {
-            triple.objlanguage = objlanguage;
-        }
-        
-        // objdatatype
-        const char* objdatatype = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
-        if (objdatatype) {
-            triple.objdatatype = objdatatype;
-        }
-        
-        triple.isLiteral = true;
-        
-        literalTriples_.push_back(triple);
-        allTriples_.push_back(triple);
-        // 트리플 저장에 따른 대략적인 메모리 증가 추적
-        GraphMemoryTracker::add(sizeof(RDFTriple));
-        
-        // 그래프 구조: (subject:uri) --[predicate]--> (literal value)
-        // 리터럴 값도 노드로 추가
-        addNode(triple.subject);  // subject URI를 노드로 추가
-        addNode(triple.object);   // 리터럴 값도 노드로 추가
-        addEdge(triple.subject, triple.predicate, triple.object, true, 
-                triple.objlanguage, triple.objdatatype);  // 리터럴 엣지 추가
+
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char* subject = columnText(stmt, 0);
+        const char* predicate = columnText(stmt, 1);
+        const char* object = columnText(stmt, 2);
+        if (!subject || !predicate || !object) continue;
+        const char* lang = columnText(stmt, 3);
+        const char* dtype = columnText(stmt, 4);
+
+        TermId s = terms_.intern(subject);
+        TermId p = terms_.intern(predicate);
+        TermId o = terms_.intern(object);
+        ++literalCount_;
+        addNode(s);  // 리터럴 값은 노드로 안 만듦
+        addEdge(s, p, o, true, lang ? terms_.intern(lang) : 0, dtype ? terms_.intern(dtype) : 0);
     }
-    
+
+    if (rc != SQLITE_DONE) {
+        std::cerr << "쿼리 실행 실패: " << sqlite3_errmsg(db_) << std::endl;
+        sqlite3_finalize(stmt);
+        return false;
+    }
     sqlite3_finalize(stmt);
     return true;
 }
 
-void RDFGraph::addNode(const std::string& uri) {
-    if (uri.empty()) return;
-    auto res = nodes_.insert(uri);
-    if (res.second) {
-        // 새로운 노드 URI가 추가될 때 문자열/노드 구조에 대한 대략적인 메모리 추정
-        GraphMemoryTracker::add(sizeof(std::string) + uri.size());
+void RDFGraph::addNode(TermId id) {
+    if (id == 0) return;  // 빈 문자열
+    if (id >= isNode_.size()) isNode_.resize(terms_.size(), 0);
+    if (!isNode_[id]) {
+        isNode_[id] = 1;
+        nodes_.push_back(id);
     }
 }
 
-void RDFGraph::addEdge(const std::string& source, const std::string& predicate, 
-                       const std::string& target, bool isLiteral,
-                       const std::string& objlanguage, const std::string& objdatatype) {
-    if (source.empty() || predicate.empty() || target.empty()) return;
-    
-    // 엣지 생성
-    RDFEdge edge;
-    edge.source = source;
-    edge.predicate = predicate;
-    edge.target = target;
-    edge.isLiteral = isLiteral;
-    edge.objlanguage = objlanguage;
-    edge.objdatatype = objdatatype;
-    
-    // 엣지 리스트에 추가
-    size_t edgeIndex = edges_.size();
-    edges_.push_back(edge);
-    // 엣지 구조 및 인덱스 저장에 대한 대략적인 메모리 추정
-    GraphMemoryTracker::add(sizeof(RDFEdge) + sizeof(size_t) * 2);
-    
-    // 인접 리스트 업데이트
-    outgoingEdges_[source].push_back(edgeIndex);
-    
-    // 리터럴인 경우에도 역방향 인접 리스트 업데이트 (리터럴도 노드이므로)
-    incomingEdges_[target].push_back(edgeIndex);
+void RDFGraph::addEdge(TermId source, TermId predicate, TermId target, bool isLiteral,
+                       TermId objlanguage, TermId objdatatype) {
+    if (source == 0 || predicate == 0 || target == 0) return;
+
+    uint32_t idx = static_cast<uint32_t>(edges_.size());
+    edges_.push_back(RDFEdge{source, predicate, target, objlanguage, objdatatype, isLiteral});
+
+    if (outgoing_.size() < terms_.size()) outgoing_.resize(terms_.size());
+    outgoing_[source].push_back(idx);
+    byPredicate_[predicate].push_back(idx);
+    if (!isLiteral) {
+        if (incoming_.size() < terms_.size()) incoming_.resize(terms_.size());
+        incoming_[target].push_back(idx);
+    }
+}
+
+EdgeRange RDFGraph::getOutgoingEdges(TermId node) const {
+    if (node >= outgoing_.size()) return EdgeRange(edges_, nullptr);
+    return EdgeRange(edges_, &outgoing_[node]);
+}
+
+EdgeRange RDFGraph::getIncomingEdges(TermId node) const {
+    if (node >= incoming_.size()) return EdgeRange(edges_, nullptr);
+    return EdgeRange(edges_, &incoming_[node]);
+}
+
+EdgeRange RDFGraph::getEdgesByPredicate(TermId predicate) const {
+    auto it = byPredicate_.find(predicate);
+    return EdgeRange(edges_, it == byPredicate_.end() ? nullptr : &it->second);
 }
 
 std::vector<std::string> RDFGraph::getResourcesByType(const std::string& type) const {
-    // 엣지 기반으로 재구현: rdf:type 엣지를 통해 타입별 노드 조회
     std::vector<std::string> result;
-    std::vector<RDFEdge> typeEdges = getEdgesByPredicate("rdf:type");
-    
-    for (const auto& edge : typeEdges) {
-        if (edge.target == type && !edge.isLiteral) {
-            result.push_back(edge.source);
+    TermId t = findTerm(type);
+    for (const auto& edge : getEdgesByPredicate(std::string("rdf:type"))) {
+        if (edge.target == t && !edge.isLiteral) {
+            result.push_back(str(edge.source));
         }
     }
-    
     return result;
 }
 
 std::vector<std::string> RDFGraph::getPropertyValues(const std::string& uri, const std::string& predicate) const {
-    // 엣지 기반으로 재구현: 나가는 엣지 중 predicate가 일치하는 것의 target 반환
     std::vector<std::string> result;
-    std::vector<RDFEdge> edges = getOutgoingEdges(uri);
-    
-    for (const auto& edge : edges) {
-        if (edge.predicate == predicate && !edge.isLiteral) {
-            result.push_back(edge.target);
+    TermId p = findTerm(predicate);
+    for (const auto& edge : getOutgoingEdges(uri)) {
+        if (edge.predicate == p && !edge.isLiteral) {
+            result.push_back(str(edge.target));
         }
     }
-    
     return result;
 }
 
-std::vector<std::tuple<std::string, std::string, std::string>> 
+std::vector<std::tuple<std::string, std::string, std::string>>
 RDFGraph::getLiteralPropertyValues(const std::string& uri, const std::string& predicate) const {
-    // 엣지 기반으로 재구현: 나가는 엣지 중 predicate가 일치하는 리터럴 엣지 반환
     std::vector<std::tuple<std::string, std::string, std::string>> result;
-    std::vector<RDFEdge> edges = getOutgoingEdges(uri);
-    
-    for (const auto& edge : edges) {
-        if (edge.predicate == predicate && edge.isLiteral) {
-            result.push_back(std::make_tuple(edge.target, edge.objdatatype, edge.objlanguage));
+    TermId p = findTerm(predicate);
+    for (const auto& edge : getOutgoingEdges(uri)) {
+        if (edge.predicate == p && edge.isLiteral) {
+            result.emplace_back(str(edge.target), str(edge.objdatatype), str(edge.objlanguage));
         }
     }
-    
-    return result;
-}
-
-std::vector<RDFEdge> RDFGraph::getOutgoingEdges(const std::string& nodeUri) const {
-    std::vector<RDFEdge> result;
-    
-    auto it = outgoingEdges_.find(nodeUri);
-    if (it == outgoingEdges_.end()) {
-        return result;
-    }
-    
-    for (size_t edgeIndex : it->second) {
-        if (edgeIndex < edges_.size()) {
-            result.push_back(edges_[edgeIndex]);
-        }
-    }
-    
-    return result;
-}
-
-std::vector<RDFEdge> RDFGraph::getIncomingEdges(const std::string& nodeUri) const {
-    std::vector<RDFEdge> result;
-    
-    auto it = incomingEdges_.find(nodeUri);
-    if (it == incomingEdges_.end()) {
-        return result;
-    }
-    
-    for (size_t edgeIndex : it->second) {
-        if (edgeIndex < edges_.size()) {
-            result.push_back(edges_[edgeIndex]);
-        }
-    }
-    
-    return result;
-}
-
-std::vector<RDFEdge> RDFGraph::getEdgesByPredicate(const std::string& predicate) const {
-    std::vector<RDFEdge> result;
-    
-    for (const auto& edge : edges_) {
-        if (edge.predicate == predicate) {
-            result.push_back(edge);
-        }
-    }
-    
-    return result;
-}
-
-std::vector<RDFEdge> RDFGraph::getEdges(const std::string& source, const std::string& target) const {
-    std::vector<RDFEdge> result;
-    
-    auto it = outgoingEdges_.find(source);
-    if (it == outgoingEdges_.end()) {
-        return result;
-    }
-    
-    for (size_t edgeIndex : it->second) {
-        if (edgeIndex < edges_.size()) {
-            const RDFEdge& edge = edges_[edgeIndex];
-            if (edge.target == target) {
-                result.push_back(edge);
-            }
-        }
-    }
-    
     return result;
 }
 
@@ -501,28 +345,18 @@ RDFGraph::Statistics RDFGraph::getStatistics() const {
     Statistics stats;
     stats.totalNodes = nodes_.size();
     stats.totalEdges = edges_.size();
-    stats.totalTriples = allTriples_.size();
-    stats.typeTriples = typeTriples_.size();
-    stats.assertedTriples = assertedTriples_.size();
-    stats.literalTriples = literalTriples_.size();
-    
-    // 타입별 리소스 수 계산 (rdf:type 엣지 기반)
-    std::vector<RDFEdge> typeEdges = getEdgesByPredicate("rdf:type");
-    for (const auto& edge : typeEdges) {
+    stats.totalTriples = typeCount_ + assertedCount_ + literalCount_;
+    stats.typeTriples = typeCount_;
+    stats.assertedTriples = assertedCount_;
+    stats.literalTriples = literalCount_;
+
+    for (const auto& edge : getEdgesByPredicate(std::string("rdf:type"))) {
         if (!edge.isLiteral) {
-            stats.resourcesByType[edge.target]++;
+            stats.resourcesByType[str(edge.target)]++;
         }
     }
-    
-    // Predicate별 엣지 수 계산
-    for (const auto& edge : edges_) {
-        stats.edgesByPredicate[edge.predicate]++;
+    for (const auto& kv : byPredicate_) {
+        stats.edgesByPredicate[str(kv.first)] = kv.second.size();
     }
-    
     return stats;
 }
-
-std::size_t RDFGraph::getTrackedMemoryBytes() const {
-    return GraphMemoryTracker::current();
-}
-

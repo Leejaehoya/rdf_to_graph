@@ -5,20 +5,31 @@
 #include <algorithm>
 #include <chrono>
 #include <iomanip>
+#include <utility>
 #include "log_util.hpp"
+
+static double elapsedMs(std::chrono::steady_clock::time_point start,
+                        std::chrono::steady_clock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+static std::string formatMs(double ms) {
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(3) << ms;
+    return oss.str();
+}
 
 // ===== LineFinderV2 구현 =====
 
-LineFinderV2::LineFinderV2(const RDFGraph& graph)
-    : graph_(graph) {
-    using clk = std::chrono::high_resolution_clock;
+LineFinderV2::LineFinderV2(const RDFGraph& graph, std::string baseUri)
+    : graph_(graph), baseUri_(std::move(baseUri)) {
+    using clk = std::chrono::steady_clock;
     auto topoStart = clk::now();
     buildTypeAndPropertyCaches();
     buildCimTopology();
     auto topoEnd = clk::now();
-    auto topoMs = std::chrono::duration_cast<std::chrono::milliseconds>(topoEnd - topoStart).count();
 
-    appendLog("[v2] topology_build_ms=" + std::to_string(topoMs));
+    appendLog("[v2] topology_build_ms=" + formatMs(elapsedMs(topoStart, topoEnd)));
 }
 
 LineFinderV2::~LineFinderV2() {
@@ -41,18 +52,16 @@ LineFinderV2::~LineFinderV2() {
 
 void LineFinderV2::buildTypeAndPropertyCaches() {
     // rdf:type 엣지를 통해 uri -> 타입 URI 목록 구성
-    std::vector<RDFEdge> typeEdges = graph_.getEdgesByPredicate("rdf:type");
-    for (const auto& edge : typeEdges) {
+    for (const auto& edge : graph_.getEdgesByPredicate("rdf:type")) {
         if (edge.isLiteral) continue;
         resourceTypes_[edge.source].push_back(edge.target);
     }
 
     // KEPCOFeeder 타입 URI 수집
     for (const auto& kv : resourceTypes_) {
-        const std::string& uri = kv.first;
-        const std::vector<std::string>& types = kv.second;
-        for (const auto& t : types) {
-            if (isKepcoFeederType(t)) {
+        TermId uri = kv.first;
+        for (TermId t : kv.second) {
+            if (isKepcoFeederType(graph_.str(t))) {
                 feederUris_.insert(uri);
                 break;
             }
@@ -60,16 +69,15 @@ void LineFinderV2::buildTypeAndPropertyCaches() {
     }
 
     // Switch.open 리터럴 값 캐시
-    const auto& literalTriples = graph_.getLiteralTriples();
     const std::string switchOpenPredicate =
         "http://iec.ch/TC57/1999/rdf-schema-extensions-19990926#Switch.open";
 
-    for (const auto& triple : literalTriples) {
-        if (triple.predicate != switchOpenPredicate) continue;
+    for (const auto& edge : graph_.getEdgesByPredicate(switchOpenPredicate)) {
+        if (!edge.isLiteral) continue;
         try {
-            int v = std::stoi(triple.object);
+            int v = std::stoi(graph_.str(edge.target));
             if (v == 0 || v == 1) {
-                switchOpenCache_[triple.subject] = v;
+                switchOpenCache_[edge.source] = v;
             }
         } catch (...) {
             // 무시
@@ -116,7 +124,7 @@ bool LineFinderV2::isACLineType(const std::string& type) const {
     return false;
 }
 
-LineFinderV2::CNId LineFinderV2::getOrCreateCNId(const std::string& cnUri) {
+LineFinderV2::CNId LineFinderV2::getOrCreateCNId(TermId cnUri) {
     auto it = cnUriToId_.find(cnUri);
     if (it != cnUriToId_.end()) {
         return it->second;
@@ -127,7 +135,7 @@ LineFinderV2::CNId LineFinderV2::getOrCreateCNId(const std::string& cnUri) {
     return id;
 }
 
-LineFinderV2::EquipmentNode* LineFinderV2::createEquipmentNode(const std::string& uri,
+LineFinderV2::EquipmentNode* LineFinderV2::createEquipmentNode(TermId uri,
                                                                EquipmentKind kind) {
     auto it = uriToEquipNode_.find(uri);
     if (it != uriToEquipNode_.end()) {
@@ -169,16 +177,26 @@ LineFinderV2::EquipmentNode* LineFinderV2::createEquipmentNode(const std::string
 }
 
 void LineFinderV2::linkEquipmentsViaConnectivityNodes() {
-    // 각 CN 에 연결된 장비들을 서로 인접 장비로 연결
+    // 각 CN 에 연결된 장비들을 서로 인접 장비로 연결.
+    // 같은 쌍이 CN 을 여러 개 공유하면 이웃이 중복되지 않게 한다.
     for (auto& kv : cnToEquipments_) {
         std::vector<EquipmentNode*>& eqs = kv.second;
         const size_t n = eqs.size();
         for (size_t i = 0; i < n; ++i) {
             EquipmentNode* a = eqs[i];
+            if (!a) continue;
             for (size_t j = 0; j < n; ++j) {
                 if (i == j) continue;
                 EquipmentNode* b = eqs[j];
-                a->neighbors.push_back(b);
+                if (!b || a == b) continue;
+                bool already = false;
+                for (EquipmentNode* nb : a->neighbors) {
+                    if (nb == b) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (!already) a->neighbors.push_back(b);
             }
         }
     }
@@ -188,9 +206,9 @@ void LineFinderV2::linkEquipmentsViaConnectivityNodes() {
 
 void LineFinderV2::buildCimTopology() {
     // Terminal - CE / CN 매핑
-    std::unordered_map<std::string, std::vector<std::string>> termToCeq;
-    std::unordered_map<std::string, std::string> termToCn;
-    std::unordered_map<std::string, std::vector<std::string>> ceqToTerms;
+    std::unordered_map<TermId, std::vector<TermId>> termToCeq;
+    std::unordered_map<TermId, TermId> termToCn;
+    std::unordered_map<TermId, std::vector<TermId>> ceqToTerms;
 
     const std::string termCeqPredicate =
         "http://iec.ch/TC57/1999/rdf-schema-extensions-19990926#Terminal.ConductingEquipment";
@@ -199,11 +217,10 @@ void LineFinderV2::buildCimTopology() {
 
     // Terminal.ConductingEquipment
     {
-        std::vector<RDFEdge> edges = graph_.getEdgesByPredicate(termCeqPredicate);
-        for (const auto& edge : edges) {
+        for (const auto& edge : graph_.getEdgesByPredicate(termCeqPredicate)) {
             if (edge.isLiteral) continue;
-            const std::string& termUri = edge.source;
-            const std::string& ceqUri  = edge.target;
+            TermId termUri = edge.source;
+            TermId ceqUri  = edge.target;
             termToCeq[termUri].push_back(ceqUri);
             ceqToTerms[ceqUri].push_back(termUri);
         }
@@ -211,26 +228,25 @@ void LineFinderV2::buildCimTopology() {
 
     // Terminal.ConnectivityNode
     {
-        std::vector<RDFEdge> edges = graph_.getEdgesByPredicate(termCnPredicate);
-        for (const auto& edge : edges) {
+        for (const auto& edge : graph_.getEdgesByPredicate(termCnPredicate)) {
             if (edge.isLiteral) continue;
-            const std::string& termUri = edge.source;
-            const std::string& cnUri   = edge.target;
+            TermId termUri = edge.source;
+            TermId cnUri   = edge.target;
             termToCn[termUri] = cnUri;
         }
     }
 
     // 1단계: CEQ URI 별로 장비 노드 생성 (Switch / ACLine / 기타는 일단 ACLine 스타일로 취급)
     for (const auto& kv : ceqToTerms) {
-        const std::string& ceqUri = kv.first;
+        TermId ceqUri = kv.first;
 
         EquipmentKind kind = EquipmentKind::ACLine; // 기본값
         auto itType = resourceTypes_.find(ceqUri);
         if (itType != resourceTypes_.end()) {
-            const std::vector<std::string>& types = itType->second;
             bool isSw = false;
             bool isLine = false;
-            for (const auto& t : types) {
+            for (TermId tid : itType->second) {
+                const std::string& t = graph_.str(tid);
                 if (isSwitchType(t)) {
                     isSw = true;
                 }
@@ -253,17 +269,17 @@ void LineFinderV2::buildCimTopology() {
 
     // 2단계: Terminal을 통해 CN ↔ 장비 매핑 구성
     for (const auto& kv : termToCeq) {
-        const std::string& termUri = kv.first;
-        const std::vector<std::string>& ceqUris = kv.second;
+        TermId termUri = kv.first;
+        const std::vector<TermId>& ceqUris = kv.second;
 
         auto itCn = termToCn.find(termUri);
         if (itCn == termToCn.end()) {
             continue; // CN 이 없는 Terminal 은 스킵
         }
-        const std::string& cnUri = itCn->second;
+        TermId cnUri = itCn->second;
         CNId cnId = getOrCreateCNId(cnUri);
 
-        for (const auto& ceqUri : ceqUris) {
+        for (TermId ceqUri : ceqUris) {
             auto itNode = uriToEquipNode_.find(ceqUri);
             if (itNode == uriToEquipNode_.end()) {
                 continue;
@@ -280,11 +296,10 @@ void LineFinderV2::buildCimTopology() {
     const std::string feederBreakerPredicate =
         "http://iec.ch/TC57/1999/rdf-schema-extensions-19990926#KEPCOFeeder.CircuitBreaker";
 
-    std::vector<RDFEdge> feederEdges = graph_.getEdgesByPredicate(feederBreakerPredicate);
-    for (const auto& edge : feederEdges) {
+    for (const auto& edge : graph_.getEdgesByPredicate(feederBreakerPredicate)) {
         if (edge.isLiteral) continue;
-        const std::string& feederUri = edge.source;
-        const std::string& cbUri     = edge.target;
+        TermId feederUri = edge.source;
+        TermId cbUri     = edge.target;
 
         // Feeder 노드
         EquipmentNode* feederNode = createEquipmentNode(feederUri, EquipmentKind::Feeder);
@@ -307,15 +322,16 @@ void LineFinderV2::buildCimTopology() {
 
 // ===== 타입 / 속성 조회 =====
 
-std::vector<std::string> LineFinderV2::getResourceTypes(const std::string& uri) const {
+const std::vector<TermId>& LineFinderV2::getResourceTypes(TermId uri) const {
+    static const std::vector<TermId> empty;
     auto it = resourceTypes_.find(uri);
     if (it == resourceTypes_.end()) {
-        return {};
+        return empty;
     }
     return it->second;
 }
 
-int LineFinderV2::getSwitchOpenValue(const std::string& switchUri) const {
+int LineFinderV2::getSwitchOpenValue(TermId switchUri) const {
     auto it = switchOpenCache_.find(switchUri);
     if (it == switchOpenCache_.end()) {
         return -1;
@@ -395,11 +411,11 @@ void LineFinderV2::findLevel1Line(const std::unordered_set<EquipmentNode*>& faul
         }
     }
     
-    // === 상시연계점 URI 출력 (v2 Level2 기준) ===
-    std::cout << "[v2 Level2] Tie-switch (Switch.open=1) URIs:" << std::endl;
+    // === 상시연계점 URI 출력 (Level1 탐색) ===
+    std::cout << "[v2 Level1] Tie-switch (Switch.open=1) URIs:" << std::endl;
     for (EquipmentNode* sw : tieSwitches) {
         if (!sw) continue;
-        std::cout << "  " << sw->uri << std::endl;
+        std::cout << "  " << graph_.str(sw->uri) << std::endl;
     }
 
     // 각 tie switch 의 반대측으로 DFS
@@ -580,7 +596,7 @@ std::string LineFinderV2::escapeXml(const std::string& text) {
     return result;
 }
 
-void LineFinderV2::exportLineToRDFXML(const std::unordered_set<std::string>& coreUris,
+void LineFinderV2::exportLineToRDFXML(const std::unordered_set<TermId>& coreUris,
                                       const std::string& outputPath) const {
     if (outputPath.empty() || coreUris.empty()) {
         return;
@@ -592,23 +608,20 @@ void LineFinderV2::exportLineToRDFXML(const std::unordered_set<std::string>& cor
     xmlStream << "<rdf:RDF xmlns:cim=\"http://iec.ch/TC57/1999/rdf-schema-extensions-19990926#\"\n";
     xmlStream << "         xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"\n";
     xmlStream << "         xmlns:rdfs=\"http://www.w3.org/2000/01/rdf-schema#\"\n";
-    xmlStream << "         xmlns=\"http://www.desktop-eqkvgq5.net/2019/cim#\"\n";
-    xmlStream << "         xmlns:desk=\"http://www.desktop-eqkvgq5.net/2019/cim#\"\n";
-    xmlStream << "         xml:base=\"http://www.desktop-eqkvgq5.net/2019/cim#\">\n";
+    xmlStream << "         xmlns=\"" << escapeXml(baseUri_) << "\"\n";
+    xmlStream << "         xmlns:desk=\"" << escapeXml(baseUri_) << "\"\n";
+    xmlStream << "         xml:base=\"" << escapeXml(baseUri_) << "\">\n";
 
-    std::string baseUri = "http://www.desktop-eqkvgq5.net/2019/cim#";
+    const TermId rdfType = graph_.findTerm("rdf:type");
+    std::unordered_set<TermId> collectedUris = coreUris;
+    std::unordered_map<TermId, std::vector<TermId>> uriTypes;
+    std::unordered_map<TermId, std::vector<RDFEdge>> uriEdges;
 
-    std::unordered_set<std::string> collectedUris = coreUris;
-    std::unordered_map<std::string, std::vector<std::string>> uriTypes;
-    std::unordered_map<std::string, std::vector<RDFEdge>> uriEdges;
+    for (TermId uri : coreUris) {
+        uriTypes[uri] = getResourceTypes(uri);
 
-    for (const std::string& uri : coreUris) {
-        std::vector<std::string> types = getResourceTypes(uri);
-        uriTypes[uri] = types;
-
-        std::vector<RDFEdge> outgoingEdges = graph_.getOutgoingEdges(uri);
-        for (const auto& edge : outgoingEdges) {
-            if (edge.predicate != "rdf:type") {
+        for (const auto& edge : graph_.getOutgoingEdges(uri)) {
+            if (edge.predicate != rdfType) {
                 uriEdges[uri].push_back(edge);
                 if (!edge.isLiteral && collectedUris.find(edge.target) == collectedUris.end()) {
                     collectedUris.insert(edge.target);
@@ -616,9 +629,8 @@ void LineFinderV2::exportLineToRDFXML(const std::unordered_set<std::string>& cor
             }
         }
 
-        std::vector<RDFEdge> incomingEdges = graph_.getIncomingEdges(uri);
-        for (const auto& edge : incomingEdges) {
-            if (edge.predicate != "rdf:type" && !edge.isLiteral) {
+        for (const auto& edge : graph_.getIncomingEdges(uri)) {
+            if (edge.predicate != rdfType && !edge.isLiteral) {
                 if (collectedUris.find(edge.source) == collectedUris.end()) {
                     collectedUris.insert(edge.source);
                 }
@@ -627,35 +639,39 @@ void LineFinderV2::exportLineToRDFXML(const std::unordered_set<std::string>& cor
         }
     }
 
-    for (const std::string& uri : collectedUris) {
+    for (TermId uri : collectedUris) {
         if (coreUris.find(uri) == coreUris.end()) {
-            std::vector<std::string> types = getResourceTypes(uri);
+            const std::vector<TermId>& types = getResourceTypes(uri);
             if (!types.empty()) {
                 uriTypes[uri] = types;
             }
 
-            std::vector<RDFEdge> outgoingEdges = graph_.getOutgoingEdges(uri);
-            for (const auto& edge : outgoingEdges) {
-                if (edge.predicate != "rdf:type") {
+            for (const auto& edge : graph_.getOutgoingEdges(uri)) {
+                if (edge.predicate != rdfType) {
                     uriEdges[uri].push_back(edge);
                 }
             }
         }
     }
 
-    for (const std::string& uri : collectedUris) {
+    // unordered_set 순서는 실행마다 바뀌므로 URI 문자열로 정렬해서 쓴다
+    std::vector<TermId> orderedUris(collectedUris.begin(), collectedUris.end());
+    std::sort(orderedUris.begin(), orderedUris.end(), [this](TermId a, TermId b) {
+        return graph_.str(a) < graph_.str(b);
+    });
+
+    for (TermId uri : orderedUris) {
         if (uriTypes.find(uri) == uriTypes.end() || uriTypes[uri].empty()) {
             continue;
         }
 
-        std::string primaryType = uriTypes[uri][0];
-        std::string shortType = getShortType(primaryType);
-        std::string relativeUri = getRelativeUri(uri, baseUri);
+        std::string shortType = getShortType(graph_.str(uriTypes[uri][0]));
+        std::string relativeUri = getRelativeUri(graph_.str(uri), baseUri_);
         
         // Switch 타입인지 확인 (모든 타입 확인)
         bool isSwitch = false;
-        for (const std::string& type : uriTypes[uri]) {
-            if (isSwitchType(type)) {
+        for (TermId type : uriTypes[uri]) {
+            if (isSwitchType(graph_.str(type))) {
                 isSwitch = true;
                 break;
             }
@@ -673,23 +689,24 @@ void LineFinderV2::exportLineToRDFXML(const std::unordered_set<std::string>& cor
             std::string switchOpen;
             
             for (const auto& edge : uriEdges[uri]) {
-                std::string shortPredicate = getShortPredicate(edge.predicate);
+                std::string shortPredicate = getShortPredicate(graph_.str(edge.predicate));
+                const std::string& target = graph_.str(edge.target);
                 
                 // IdentifiedObject.name 저장
                 if (shortPredicate == "cim:IdentifiedObject.name" && edge.isLiteral) {
-                    identifiedObjectName = edge.target;
+                    identifiedObjectName = target;
                     continue; // 나중에 출력
                 }
                 
                 // Switch.open 저장 (Switch인 경우)
                 if (isSwitch && shortPredicate == "cim:Switch.open" && edge.isLiteral) {
-                    switchOpen = edge.target;
+                    switchOpen = target;
                     continue; // 나중에 출력
                 }
                 
                 // rdf:resource 속성만 출력 (리터럴이 아닌 속성)
                 if (!edge.isLiteral) {
-                    std::string relativeTarget = getRelativeUri(edge.target, baseUri);
+                    std::string relativeTarget = getRelativeUri(target, baseUri_);
                     
                     // 중복 체크를 위한 키 생성
                     std::string edgeKey = shortPredicate + "|" + relativeTarget;
@@ -698,9 +715,9 @@ void LineFinderV2::exportLineToRDFXML(const std::unordered_set<std::string>& cor
                     }
                     seenEdges.insert(edgeKey);
                     
-                    if (relativeTarget == edge.target) {
+                    if (relativeTarget == target) {
                         xmlStream << "                <" << escapeXml(shortPredicate)
-                                  << " rdf:resource=\"" << escapeXml(edge.target) << "\"/>\n";
+                                  << " rdf:resource=\"" << escapeXml(target) << "\"/>\n";
                     } else {
                         xmlStream << "                <" << escapeXml(shortPredicate)
                                   << " rdf:resource=\"#" << escapeXml(relativeTarget) << "\"/>\n";
@@ -743,11 +760,11 @@ void LineFinderV2::exportLineToRDFXML(const std::unordered_set<std::string>& cor
 
 bool LineFinderV2::findFaultLineAndGenerateRDFXML(const std::string& switchUri,
                                                   const std::string& outputPath) {
-    using clk = std::chrono::high_resolution_clock;
+    using clk = std::chrono::steady_clock;
     auto allStart = clk::now();
 
     // 시작 스위치 장비 노드 찾기
-    auto itStart = uriToEquipNode_.find(switchUri);
+    auto itStart = uriToEquipNode_.find(graph_.findTerm(switchUri));
     if (itStart == uriToEquipNode_.end()) {
         std::cerr << "LineFinderV2: 시작 스위치 URI에 해당하는 장비 노드를 찾을 수 없습니다: "
                   << switchUri << std::endl;
@@ -763,11 +780,10 @@ bool LineFinderV2::findFaultLineAndGenerateRDFXML(const std::string& switchUri,
     findLevel1Line(faultEquipments, level1Equipments);
     findLevel2Line(faultEquipments, level1Equipments, level2Equipments);
     auto searchEnd = clk::now();
-    auto searchMs =
-        std::chrono::duration_cast<std::chrono::milliseconds>(searchEnd - searchStart).count();
+    double searchMs = elapsedMs(searchStart, searchEnd);
 
     // URI 집합 변환
-    std::unordered_set<std::string> faultLineUris, level1Uris, level2Uris;
+    std::unordered_set<TermId> faultLineUris, level1Uris, level2Uris;
     for (auto* n : faultEquipments) if (n) faultLineUris.insert(n->uri);
     for (auto* n : level1Equipments) if (n) level1Uris.insert(n->uri);
     for (auto* n : level2Equipments) if (n) level2Uris.insert(n->uri);
@@ -781,10 +797,9 @@ bool LineFinderV2::findFaultLineAndGenerateRDFXML(const std::string& switchUri,
         // (exportLineToRDFXML 은 파일만 출력하므로 이 경우는 생략)
     }
     auto faultXmlEnd = clk::now();
-    auto faultXmlMs =
-        std::chrono::duration_cast<std::chrono::milliseconds>(faultXmlEnd - faultXmlStart).count();
+    double faultXmlMs = elapsedMs(faultXmlStart, faultXmlEnd);
 
-    long long level1XmlMs = 0, level2XmlMs = 0;
+    double level1XmlMs = 0, level2XmlMs = 0;
     if (!outputPath.empty()) {
         std::string base = outputPath;
         std::string ext  = "";
@@ -797,21 +812,18 @@ bool LineFinderV2::findFaultLineAndGenerateRDFXML(const std::string& switchUri,
             auto t1 = clk::now();
             exportLineToRDFXML(level1Uris, base + "_level1" + ext);
             auto t2 = clk::now();
-            level1XmlMs =
-                std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+            level1XmlMs = elapsedMs(t1, t2);
         }
         if (!level2Uris.empty()) {
             auto t1 = clk::now();
             exportLineToRDFXML(level2Uris, base + "_level2" + ext);
             auto t2 = clk::now();
-            level2XmlMs =
-                std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+            level2XmlMs = elapsedMs(t1, t2);
         }
     }
 
     auto allEnd = clk::now();
-    auto allMs =
-        std::chrono::duration_cast<std::chrono::milliseconds>(allEnd - allStart).count();
+    double allMs = elapsedMs(allStart, allEnd);
 
     // 선로별 장치 수 / 노드 수
     auto faultDevices = faultEquipments.size();
@@ -828,15 +840,15 @@ bool LineFinderV2::findFaultLineAndGenerateRDFXML(const std::string& switchUri,
         " fault_nodes=" + std::to_string(faultNodes) +
         " level1_nodes=" + std::to_string(level1Nodes) +
         " level2_nodes=" + std::to_string(level2Nodes) +
-        " search_ms=" + std::to_string(searchMs) +
-        " fault_xml_ms=" + std::to_string(faultXmlMs) +
-        " level1_xml_ms=" + std::to_string(level1XmlMs) +
-        " level2_xml_ms=" + std::to_string(level2XmlMs) +
-        " total_ms=" + std::to_string(allMs)
+        " search_ms=" + formatMs(searchMs) +
+        " fault_xml_ms=" + formatMs(faultXmlMs) +
+        " level1_xml_ms=" + formatMs(level1XmlMs) +
+        " level2_xml_ms=" + formatMs(level2XmlMs) +
+        " total_ms=" + formatMs(allMs)
     );
 
     // 요약 출력
-    std::cout << std::fixed << std::setprecision(2);
+    std::cout << std::fixed << std::setprecision(3);
     std::cout << "\n========================================" << std::endl;
     std::cout << "LineFinderV2 고장선로 및 Level1/Level2 탐색 완료" << std::endl;
     std::cout << "========================================" << std::endl;

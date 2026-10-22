@@ -148,7 +148,7 @@ Switch (_11922100000118)
 ## 주요 속성 (Properties)
 
 ### Switch 속성
-- `Switch.open`: 현재 상태 (0=닫힘, 1=열림) ⭐ **중요**
+- `Switch.open`: 현재 상태 (0=닫힘, 1=열림) 
 - `Switch.normalOpen`: 상시 개방 여부 (0=상시 닫힘, 1=상시 열림)
 - `Switch.appOpen`: 외관상 개방 여부
 - `Switch.isControllable`: 제어 가능 여부

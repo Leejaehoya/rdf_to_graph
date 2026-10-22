@@ -6,6 +6,7 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <cstdint>
 
 /**
  * CIM 토폴로지 전용 장비 그래프를 이용한 고장선로 탐색 V2
@@ -19,9 +20,14 @@ public:
     /**
      * 생성자
      * @param graph RDF 그래프 객체 (참조로 전달, 수명은 LineFinderV2 보다 길어야 함)
+     * @param baseUri RDF/XML xmlns, xml:base 에 넣을 base URI
      */
-    LineFinderV2(const RDFGraph& graph);
+    explicit LineFinderV2(const RDFGraph& graph, std::string baseUri);
     ~LineFinderV2();
+
+    // raw pointer 를 들고 있어서 복사되면 double delete 남
+    LineFinderV2(const LineFinderV2&) = delete;
+    LineFinderV2& operator=(const LineFinderV2&) = delete;
 
     /**
      * 고장선로 탐색 및 RDF/XML 생성 (장비 그래프 기반)
@@ -64,11 +70,11 @@ private:
      */
     struct EquipmentNode {
         EquipmentKind kind;
-        std::string   uri;
+        TermId        uri;
         void*         data;              // SwitchData* / ACLineData* / FeederData*
         std::vector<EquipmentNode*> neighbors;
 
-        EquipmentNode(EquipmentKind k, const std::string& u)
+        EquipmentNode(EquipmentKind k, TermId u)
             : kind(k), uri(u), data(nullptr) {}
     };
 
@@ -76,19 +82,20 @@ private:
     using CNId = uint32_t;
 
     const RDFGraph& graph_;
+    std::string baseUri_;
 
     // 타입 / 속성 캐시
-    std::unordered_map<std::string, std::vector<std::string>> resourceTypes_;   // uri -> type uri 목록
-    std::unordered_map<std::string, int> switchOpenCache_;                      // switch uri -> open (0/1/-1)
-    std::unordered_set<std::string> feederUris_;                                // KEPCOFeeder uri 집합
+    std::unordered_map<TermId, std::vector<TermId>> resourceTypes_;   // uri -> type 목록
+    std::unordered_map<TermId, int> switchOpenCache_;                 // switch -> open (0/1)
+    std::unordered_set<TermId> feederUris_;                           // KEPCOFeeder 집합
 
     // CN 매핑
-    std::unordered_map<std::string, CNId> cnUriToId_;                            // CN uri -> CNId
-    std::vector<std::string>              cnIdToUri_;                            // CNId -> CN uri
+    std::unordered_map<TermId, CNId> cnUriToId_;                                 // CN uri -> CNId
+    std::vector<TermId>              cnIdToUri_;                                 // CNId -> CN uri
     std::unordered_map<CNId, std::vector<EquipmentNode*>> cnToEquipments_;      // CNId -> 장비 노드들
 
     // 장비 노드 및 실제 데이터 보관 (수명 관리)
-    std::unordered_map<std::string, EquipmentNode*> uriToEquipNode_;            // uri -> 장비 노드
+    std::unordered_map<TermId, EquipmentNode*> uriToEquipNode_;            // uri -> 장비 노드
     std::vector<EquipmentNode*> allEquipNodes_;                                  // 소멸자에서 delete
     std::vector<SwitchData*>    allSwitchData_;
     std::vector<ACLineData*>    allACLineData_;
@@ -112,10 +119,10 @@ private:
     bool isACLineType(const std::string& type) const;
 
     /** CN URI 를 CNId 로 매핑 (없으면 생성) */
-    CNId getOrCreateCNId(const std::string& cnUri);
+    CNId getOrCreateCNId(TermId cnUri);
 
     /** 장비 노드 생성 (이미 있으면 그대로 반환) */
-    EquipmentNode* createEquipmentNode(const std::string& uri, EquipmentKind kind);
+    EquipmentNode* createEquipmentNode(TermId uri, EquipmentKind kind);
 
     /** CN 별로 연결된 장비 노드들을 인접 리스트로 연결 */
     void linkEquipmentsViaConnectivityNodes();
@@ -123,10 +130,10 @@ private:
     // ===== DFS / 결과 생성 관련 =====
 
     /** 리소스 타입 조회 (캐시 기반) */
-    std::vector<std::string> getResourceTypes(const std::string& uri) const;
+    const std::vector<TermId>& getResourceTypes(TermId uri) const;
 
     /** Switch.open 값 조회 (캐시 기반) */
-    int getSwitchOpenValue(const std::string& switchUri) const;
+    int getSwitchOpenValue(TermId switchUri) const;
 
     /** DFS 를 이용해 고장선로에 포함되는 장비 노드 집합을 계산 */
     void dfsFaultSearch(EquipmentNode* startNode,
@@ -153,7 +160,7 @@ private:
     /**
      * 주어진 URI 집합을 기반으로 RDF/XML 서브그래프 파일 생성 (v2용)
      */
-    void exportLineToRDFXML(const std::unordered_set<std::string>& coreUris,
+    void exportLineToRDFXML(const std::unordered_set<TermId>& coreUris,
                             const std::string& outputPath) const;
 
     // ===== RDF/XML 생성에 필요한 유틸리티 (LineFinder 와 동일한 포맷) =====
