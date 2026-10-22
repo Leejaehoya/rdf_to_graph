@@ -1,6 +1,6 @@
 # 컴파일러 및 플래그 설정
 CXX = g++
-CXXFLAGS = -std=c++11 -Wall -Wextra -O2
+CXXFLAGS = -std=c++17 -Wall -Wextra -O2
 LDFLAGS = -lsqlite3
 
 # 디렉토리 설정
@@ -15,14 +15,12 @@ TARGET = graph_viewer
 MAIN_SRC = $(SRC_DIR)/main.cpp
 MODULE_SRCS = $(MODULE_DIR)/rdf_graph_generator.cpp \
               $(MODULE_DIR)/line_finder_v2.cpp \
-              $(MODULE_DIR)/graph_memory_tracker.cpp \
               $(MODULE_DIR)/log_util.cpp
 
 # 오브젝트 파일들
 MAIN_OBJ = $(OBJ_DIR)/main.o
 MODULE_OBJS = $(OBJ_DIR)/rdf_graph_generator.o \
               $(OBJ_DIR)/line_finder_v2.o \
-              $(OBJ_DIR)/graph_memory_tracker.o \
               $(OBJ_DIR)/log_util.o
 
 ALL_OBJS = $(MAIN_OBJ) $(MODULE_OBJS)
@@ -51,9 +49,6 @@ $(OBJ_DIR)/rdf_graph_generator.o: $(MODULE_DIR)/rdf_graph_generator.cpp $(MODULE
 
 $(OBJ_DIR)/line_finder_v2.o: $(MODULE_DIR)/line_finder_v2.cpp $(MODULE_DIR)/line_finder_v2.hpp $(MODULE_DIR)/rdf_graph_generator.hpp
 	$(CXX) $(CXXFLAGS) -c $(MODULE_DIR)/line_finder_v2.cpp -o $(OBJ_DIR)/line_finder_v2.o
-
-$(OBJ_DIR)/graph_memory_tracker.o: $(MODULE_DIR)/graph_memory_tracker.cpp $(MODULE_DIR)/graph_memory_tracker.hpp
-	$(CXX) $(CXXFLAGS) -c $(MODULE_DIR)/graph_memory_tracker.cpp -o $(OBJ_DIR)/graph_memory_tracker.o
 
 $(OBJ_DIR)/log_util.o: $(MODULE_DIR)/log_util.cpp $(MODULE_DIR)/log_util.hpp
 	$(CXX) $(CXXFLAGS) -c $(MODULE_DIR)/log_util.cpp -o $(OBJ_DIR)/log_util.o
